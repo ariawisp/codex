@@ -1,0 +1,18 @@
+[package]
+name = "codexpc-xpc"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "codexpc_xpc"
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1.0"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "1.0"
+

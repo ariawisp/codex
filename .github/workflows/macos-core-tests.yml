@@ -1,0 +1,24 @@
+name: macOS Core Tests
+
+on:
+  push:
+    paths:
+      - 'codex-rs/**'
+      - '.github/workflows/macos-core-tests.yml'
+  pull_request:
+    paths:
+      - 'codex-rs/**'
+      - '.github/workflows/macos-core-tests.yml'
+
+jobs:
+  test-core:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build and test core (unit tests only)
+        run: |
+          cd codex-rs
+          cargo test -p codex-core -- --exclude-should-panic
+

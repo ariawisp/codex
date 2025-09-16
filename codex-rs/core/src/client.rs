@@ -156,6 +156,24 @@ impl ModelClient {
 
     /// Implementation for the OpenAI *Responses* experimental API.
     async fn stream_responses(&self, prompt: &Prompt) -> Result<ResponseStream> {
+        // Special-case: CodexPC provider uses a local macOS XPC daemon. Prefer
+        // direct XPC on macOS; fall back to a CLI shim otherwise.
+        if self
+            .provider
+            .base_url
+            .as_deref()
+            .is_some_and(|u| u.starts_with("xpc://"))
+        {
+            #[cfg(target_os = "macos")]
+            {
+                return self.stream_via_codexpc_xpc(prompt).await;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                return self.stream_via_codexpc_cli(prompt).await;
+            }
+        }
+
         if let Some(path) = &*CODEX_RS_SSE_FIXTURE {
             // short circuit for tests
             warn!(path, "Streaming from fixture");
@@ -362,6 +380,251 @@ impl ModelClient {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    async fn stream_via_codexpc_xpc(&self, prompt: &Prompt) -> Result<ResponseStream> {
+        use tokio::task;
+        use crate::protocol::TokenUsage;
+        let checkpoint = std::env::var("CODEXPC_CHECKPOINT")
+            .or_else(|_| std::env::var("CODEXPC_CHECKPOINT_PATH"))
+            .map_err(|_| CodexErr::Other("Set CODEXPC_CHECKPOINT to your GPT-OSS checkpoint path".into()))?;
+        let service = std::env::var("CODEXPC_SERVICE").unwrap_or_else(|_| "com.yourorg.codexpc".into());
+        let instructions = prompt.get_full_instructions(&self.config.model_family).to_string();
+        let max_tokens = self.config.model_max_output_tokens.unwrap_or(128) as u64;
+        let temperature = 0.0f64; // TODO: plumb sampling
+        // Build Harmony conversation JSON using a helper
+        let formatted = prompt.get_formatted_input();
+        let conversation_json = build_harmony_conversation_json(&instructions, &formatted);
+        let tools_json = if !prompt.tools.is_empty() { Some(String::from("[]")) } else { None };
+        // Include minimal reasoning flags when configured
+        let reasoning_json = {
+            let effort = self.effort;
+            let summary = self.summary;
+            let mut fields: Vec<String> = Vec::new();
+            if let Some(e) = effort { fields.push(format!("\"effort\":\"{}\"", e.to_string().to_lowercase())); }
+            fields.push(format!("\"summary\":\"{}\"", summary.to_string().to_lowercase()));
+            if fields.is_empty() { None } else { Some(format!("{{{}}}", fields.join(","))) }
+        };
+
+        let (handle, mut rx) = codexpc_xpc::stream(&service, &checkpoint, &instructions, conversation_json.as_deref(), tools_json.as_deref(), reasoning_json.as_deref(), temperature, max_tokens);
+        let (tx, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
+        task::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let send = match ev {
+                    codexpc_xpc::Event::Created => tx.send(Ok(ResponseEvent::Created)).await,
+                    codexpc_xpc::Event::OutputTextDelta(s) => tx.send(Ok(ResponseEvent::OutputTextDelta(s))).await,
+                    codexpc_xpc::Event::Completed { response_id, input_tokens, output_tokens, total_tokens } => {
+                        let usage = Some(TokenUsage { input_tokens, output_tokens, total_tokens });
+                        tx.send(Ok(ResponseEvent::Completed { response_id, token_usage: usage })).await
+                    },
+                    codexpc_xpc::Event::OutputItemDone { item_type, status, name, input } => {
+                        // Map tool placeholder into a CustomToolCall; use name/input when present
+                        let item = codex_protocol::models::ResponseItem::CustomToolCall {
+                            id: None,
+                            status: if status.is_empty() { None } else { Some(status) },
+                            call_id: "codexpc".into(),
+                            name: if name.is_empty() { if item_type.is_empty() { "tool".into() } else { item_type } } else { name },
+                            input,
+                        };
+                        tx.send(Ok(ResponseEvent::OutputItemDone(item))).await
+                    }
+                    codexpc_xpc::Event::OutputItemOutput { name, output } => {
+                        let item = codex_protocol::models::ResponseItem::CustomToolCallOutput {
+                            call_id: name,
+                            output,
+                        };
+                        tx.send(Ok(ResponseEvent::OutputItemDone(item))).await
+                    }
+                    codexpc_xpc::Event::Error { code, message } => tx.send(Err(CodexErr::Stream(format!("{code}: {message}"), None))).await,
+                };
+                if send.is_err() { break; }
+            }
+            drop(handle);
+        });
+        Ok(ResponseStream { rx_event })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn json_escape(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn build_content_part_json(part: &codex_protocol::models::ContentItem) -> Option<String> {
+        match part {
+            codex_protocol::models::ContentItem::InputText { text }
+            | codex_protocol::models::ContentItem::OutputText { text } => {
+                Some(format!("{{\"text\":\"{}\"}}", Self::json_escape(text)))
+            }
+            codex_protocol::models::ContentItem::InputImage { image_url } => {
+                Some(format!("{{\"image_url\":\"{}\"}}", Self::json_escape(image_url)))
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn build_harmony_conversation_json(
+        instructions: &str,
+        items: &[ResponseItem],
+    ) -> Option<String> {
+        let mut conv_msgs: Vec<String> = Vec::new();
+        if !instructions.is_empty() {
+            conv_msgs.push(format!(
+                "{{\"author\":{{\"role\":\"system\"}},\"content\":[{{\"text\":\"{}\"}}]}}",
+                Self::json_escape(instructions)
+            ));
+        }
+        // Include a developer message describing available demo tools to encourage tool use.
+        // (Future: embed full tool schemas once Harmony developer message tooling is available.)
+        let tool_desc = Self::build_tool_description();
+        if let Some(desc) = tool_desc {
+            conv_msgs.push(format!(
+                "{{\"author\":{{\"role\":\"developer\"}},\"content\":[{{\"text\":\"{}\"}}]}}",
+                Self::json_escape(&desc)
+            ));
+        }
+        for item in items.iter() {
+            if let ResponseItem::Message { role, content, .. } = item {
+                let mut parts: Vec<String> = Vec::new();
+                for part in content.iter() {
+                    if let Some(js) = Self::build_content_part_json(part) {
+                        parts.push(js);
+                    }
+                }
+                if !parts.is_empty() {
+                    let role_esc = role.replace('"', "\"");
+                    conv_msgs.push(format!(
+                        "{{\"author\":{{\"role\":\"{}\"}},\"content\":[{}]}}",
+                        role_esc,
+                        parts.join(",")
+                    ));
+                }
+            }
+        }
+        if conv_msgs.is_empty() {
+            None
+        } else {
+            Some(format!("{{\"messages\":[{}]}}", conv_msgs.join(",")))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn build_tool_description() -> Option<String> {
+        // At this layer we do not have structured tool schema serialization for Harmony developer messages yet.
+        // Provide a friendly hint listing tool names we support locally, with simple schemas.
+        let supported = [
+            ("echo", "{\\\"type\\\":\\\"object\\\",\\\"properties\\\":{\\\"msg\\\":{\\\"type\\\":\\\"string\\\"}}}"),
+            ("upper", "{\\\"type\\\":\\\"object\\\",\\\"properties\\\":{\\\"msg\\\":{\\\"type\\\":\\\"string\\\"}}}"),
+        ];
+        if supported.is_empty() { return None; }
+        let list = supported.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ");
+        let schemas = supported.iter().map(|(n, sch)| format!("{}: {}", n, sch)).collect::<Vec<_>>().join("; ");
+        Some(format!(
+            "Available tools: {}. Schemas: {}. To call a tool, set the recipient to the tool name and provide JSON arguments in commentary channel.",
+            list, schemas
+        ))
+    }
+
+    async fn stream_via_codexpc_cli(&self, prompt: &Prompt) -> Result<ResponseStream> {
+        use tokio::io::{AsyncReadExt, BufReader};
+        use tokio::process::Command;
+
+        let checkpoint = std::env::var("CODEXPC_CHECKPOINT")
+            .or_else(|_| std::env::var("CODEXPC_CHECKPOINT_PATH"))
+            .map_err(|_| CodexErr::Other("Set CODEXPC_CHECKPOINT to your GPT-OSS checkpoint path".into()))?;
+        let service = std::env::var("CODEXPC_SERVICE").unwrap_or_else(|_| "com.yourorg.codexpc".into());
+
+        let instructions = prompt.get_full_instructions(&self.config.model_family).to_string();
+        let max_tokens = self
+            .config
+            .model_max_output_tokens
+            .unwrap_or(128) as u64;
+        let mut cmd = Command::new("codexpc-cli");
+        cmd.arg("--service")
+            .arg(service)
+            .arg("--checkpoint")
+            .arg(checkpoint)
+            .arg("--prompt")
+            .arg(instructions)
+            .arg("--max-tokens")
+            .arg(max_tokens.to_string());
+
+        let mut child = cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| CodexErr::Other(format!("failed to spawn codexpc-cli: {e}")))?;
+
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let mut reader = BufReader::new(stdout);
+        let mut err_reader = BufReader::new(stderr);
+
+        let (tx, rx) = mpsc::channel::<Result<ResponseEvent>>(1600);
+
+        // Forward stdout chunks as deltas
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let s = String::from_utf8_lossy(&buf[..n]).to_string();
+                        // Filter out our CLI bracketed markers while still forwarding model text.
+                        if s.trim() == "[created]" {
+                            let _ = tx.send(Ok(ResponseEvent::Created)).await; continue;
+                        }
+                        if s.contains("[completed]") {
+                            let _ = tx
+                                .send(Ok(ResponseEvent::Completed { response_id: "codexpc".into(), token_usage: None }))
+                                .await;
+                            break;
+                        }
+                        let _ = tx.send(Ok(ResponseEvent::OutputTextDelta(s))).await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(CodexErr::Stream(format!("read stdout error: {e}"), None))).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Drain stderr in background to avoid blocking
+        let tx_err = tx.clone();
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if err_reader.read_to_end(&mut buf).await.is_ok() {
+                if !buf.is_empty() {
+                    let _ = tx_err
+                        .send(Err(CodexErr::Stream(
+                            String::from_utf8_lossy(&buf).to_string(),
+                            None,
+                        )))
+                        .await;
+                }
+            }
+        });
+
+        // Reap process
+        let tx_done = tx.clone();
+        tokio::spawn(async move {
+            if let Ok(status) = child.wait().await {
+                if !status.success() {
+                    let _ = tx_done
+                        .send(Err(CodexErr::Other(format!(
+                            "codexpc-cli exited with status {status}"
+                        ))))
+                        .await;
+                }
+            }
+        });
+
+        Ok(ResponseStream { rx_event: rx })
+    }
+
     pub fn get_provider(&self) -> ModelProviderInfo {
         self.provider.clone()
     }
@@ -398,6 +661,45 @@ struct SseEvent {
     response: Option<Value>,
     item: Option<Value>,
     delta: Option<String>,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod harmony_json_tests {
+    use super::*;
+    use codex_protocol::models::{ContentItem, ResponseItem};
+
+    #[test]
+    fn builds_system_and_user_text() {
+        let items = vec![ResponseItem::Message {
+            id: None,
+            role: "user".into(),
+            content: vec![ContentItem::InputText { text: "Hello".into() }],
+        }];
+        let json = ModelClient::build_harmony_conversation_json("Instructions", &items).unwrap();
+        assert!(json.contains("\"role\":\"system\""));
+        assert!(json.contains("Instructions"));
+        assert!(json.contains("\"role\":\"user\""));
+        assert!(json.contains("Hello"));
+    }
+
+    #[test]
+    fn includes_image_url_parts() {
+        let items = vec![ResponseItem::Message {
+            id: None,
+            role: "user".into(),
+            content: vec![ContentItem::InputImage { image_url: "http://example.com/img.png".into() }],
+        }];
+        let json = ModelClient::build_harmony_conversation_json("", &items).unwrap();
+        assert!(json.contains("image_url"));
+        assert!(json.contains("http://example.com/img.png"));
+    }
+
+    #[test]
+    fn includes_developer_tools_message() {
+        let json = ModelClient::build_harmony_conversation_json("", &[]).unwrap();
+        assert!(json.contains("\"role\":\"developer\""));
+        assert!(json.contains("Available tools"));
+    }
 }
 
 #[derive(Debug, Deserialize)]
