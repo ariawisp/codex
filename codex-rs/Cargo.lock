@@ -673,6 +673,7 @@ dependencies = [
  "codex-file-search",
  "codex-mcp-client",
  "codex-protocol",
+ "codexpc-xpc",
  "core_test_support",
  "dirs",
  "env-flags",
@@ -953,6 +954,14 @@ dependencies = [
  "unicode-width 0.1.14",
  "url",
  "vt100",
+]
+
+[[package]]
+name = "codexpc-xpc"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "tokio",
 ]
 
 [[package]]

@@ -31,7 +31,7 @@ use crate::client_common::create_reasoning_param_for_request;
 use crate::client_common::create_text_param_for_request;
 use crate::config::Config;
 use crate::default_client::create_client;
-use crate::error::CodexErr;
+use crate::error::{CodexErr, EnvVarError};
 use crate::error::Result;
 use crate::error::UsageLimitReachedError;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
@@ -386,14 +386,20 @@ impl ModelClient {
         use crate::protocol::TokenUsage;
         let checkpoint = std::env::var("CODEXPC_CHECKPOINT")
             .or_else(|_| std::env::var("CODEXPC_CHECKPOINT_PATH"))
-            .map_err(|_| CodexErr::Other("Set CODEXPC_CHECKPOINT to your GPT-OSS checkpoint path".into()))?;
+            .map_err(|_| {
+                CodexErr::EnvVar(EnvVarError {
+                    var: "CODEXPC_CHECKPOINT".into(),
+                    instructions: Some("Set CODEXPC_CHECKPOINT to your GPT-OSS checkpoint path".into()),
+                })
+            })?;
         let service = std::env::var("CODEXPC_SERVICE").unwrap_or_else(|_| "com.yourorg.codexpc".into());
         let instructions = prompt.get_full_instructions(&self.config.model_family).to_string();
         let max_tokens = self.config.model_max_output_tokens.unwrap_or(128) as u64;
         let temperature = 0.0f64; // TODO: plumb sampling
         // Build Harmony conversation JSON using a helper
         let formatted = prompt.get_formatted_input();
-        let conversation_json = build_harmony_conversation_json(&instructions, &formatted);
+        let include_dev_tools_msg = !prompt.tools.is_empty();
+        let conversation_json = Self::build_harmony_conversation_json(&instructions, &formatted, include_dev_tools_msg);
         let tools_json = if !prompt.tools.is_empty() { Some(String::from("[]")) } else { None };
         // Include minimal reasoning flags when configured
         let reasoning_json = {
@@ -413,7 +419,7 @@ impl ModelClient {
                     codexpc_xpc::Event::Created => tx.send(Ok(ResponseEvent::Created)).await,
                     codexpc_xpc::Event::OutputTextDelta(s) => tx.send(Ok(ResponseEvent::OutputTextDelta(s))).await,
                     codexpc_xpc::Event::Completed { response_id, input_tokens, output_tokens, total_tokens } => {
-                        let usage = Some(TokenUsage { input_tokens, output_tokens, total_tokens });
+                        let usage = Some(TokenUsage { input_tokens, cached_input_tokens: 0, output_tokens, reasoning_output_tokens: 0, total_tokens });
                         tx.send(Ok(ResponseEvent::Completed { response_id, token_usage: usage })).await
                     },
                     codexpc_xpc::Event::OutputItemDone { item_type, status, name, input } => {
@@ -474,6 +480,7 @@ impl ModelClient {
     fn build_harmony_conversation_json(
         instructions: &str,
         items: &[ResponseItem],
+        include_dev_tools_msg: bool,
     ) -> Option<String> {
         let mut conv_msgs: Vec<String> = Vec::new();
         if !instructions.is_empty() {
@@ -483,13 +490,14 @@ impl ModelClient {
             ));
         }
         // Include a developer message describing available demo tools to encourage tool use.
-        // (Future: embed full tool schemas once Harmony developer message tooling is available.)
-        let tool_desc = Self::build_tool_description();
-        if let Some(desc) = tool_desc {
-            conv_msgs.push(format!(
-                "{{\"author\":{{\"role\":\"developer\"}},\"content\":[{{\"text\":\"{}\"}}]}}",
-                Self::json_escape(&desc)
-            ));
+        // Gate on presence of tools to avoid inflating input tokens when no tools are available.
+        if include_dev_tools_msg {
+            if let Some(desc) = Self::build_tool_description() {
+                conv_msgs.push(format!(
+                    "{{\"author\":{{\"role\":\"developer\"}},\"content\":[{{\"text\":\"{}\"}}]}}",
+                    Self::json_escape(&desc)
+                ));
+            }
         }
         for item in items.iter() {
             if let ResponseItem::Message { role, content, .. } = item {
@@ -539,7 +547,12 @@ impl ModelClient {
 
         let checkpoint = std::env::var("CODEXPC_CHECKPOINT")
             .or_else(|_| std::env::var("CODEXPC_CHECKPOINT_PATH"))
-            .map_err(|_| CodexErr::Other("Set CODEXPC_CHECKPOINT to your GPT-OSS checkpoint path".into()))?;
+            .map_err(|_| {
+                CodexErr::EnvVar(EnvVarError {
+                    var: "CODEXPC_CHECKPOINT".into(),
+                    instructions: Some("Set CODEXPC_CHECKPOINT to your GPT-OSS checkpoint path".into()),
+                })
+            })?;
         let service = std::env::var("CODEXPC_SERVICE").unwrap_or_else(|_| "com.yourorg.codexpc".into());
 
         let instructions = prompt.get_full_instructions(&self.config.model_family).to_string();
@@ -560,7 +573,7 @@ impl ModelClient {
         let mut child = cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| CodexErr::Other(format!("failed to spawn codexpc-cli: {e}")))?;
+            .map_err(CodexErr::Io)?;
 
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -568,6 +581,7 @@ impl ModelClient {
         let mut err_reader = BufReader::new(stderr);
 
         let (tx, rx) = mpsc::channel::<Result<ResponseEvent>>(1600);
+        let tx_stdout = tx.clone();
 
         // Forward stdout chunks as deltas
         tokio::spawn(async move {
@@ -579,18 +593,18 @@ impl ModelClient {
                         let s = String::from_utf8_lossy(&buf[..n]).to_string();
                         // Filter out our CLI bracketed markers while still forwarding model text.
                         if s.trim() == "[created]" {
-                            let _ = tx.send(Ok(ResponseEvent::Created)).await; continue;
+                            let _ = tx_stdout.send(Ok(ResponseEvent::Created)).await; continue;
                         }
                         if s.contains("[completed]") {
-                            let _ = tx
+                            let _ = tx_stdout
                                 .send(Ok(ResponseEvent::Completed { response_id: "codexpc".into(), token_usage: None }))
                                 .await;
                             break;
                         }
-                        let _ = tx.send(Ok(ResponseEvent::OutputTextDelta(s))).await;
+                        let _ = tx_stdout.send(Ok(ResponseEvent::OutputTextDelta(s))).await;
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(CodexErr::Stream(format!("read stdout error: {e}"), None))).await;
+                        let _ = tx_stdout.send(Err(CodexErr::Stream(format!("read stdout error: {e}"), None))).await;
                         break;
                     }
                 }
@@ -619,9 +633,10 @@ impl ModelClient {
             if let Ok(status) = child.wait().await {
                 if !status.success() {
                     let _ = tx_done
-                        .send(Err(CodexErr::Other(format!(
-                            "codexpc-cli exited with status {status}"
-                        ))))
+                        .send(Err(CodexErr::Stream(
+                            format!("codexpc-cli exited with status {status}"),
+                            None,
+                        )))
                         .await;
                 }
             }
@@ -680,7 +695,7 @@ mod harmony_json_tests {
             role: "user".into(),
             content: vec![ContentItem::InputText { text: "Hello".into() }],
         }];
-        let json = ModelClient::build_harmony_conversation_json("Instructions", &items).unwrap();
+        let json = ModelClient::build_harmony_conversation_json("Instructions", &items, false).unwrap();
         assert!(json.contains("\"role\":\"system\""));
         assert!(json.contains("Instructions"));
         assert!(json.contains("\"role\":\"user\""));
@@ -694,14 +709,14 @@ mod harmony_json_tests {
             role: "user".into(),
             content: vec![ContentItem::InputImage { image_url: "http://example.com/img.png".into() }],
         }];
-        let json = ModelClient::build_harmony_conversation_json("", &items).unwrap();
+        let json = ModelClient::build_harmony_conversation_json("", &items, false).unwrap();
         assert!(json.contains("image_url"));
         assert!(json.contains("http://example.com/img.png"));
     }
 
     #[test]
     fn includes_developer_tools_message() {
-        let json = ModelClient::build_harmony_conversation_json("", &[]).unwrap();
+        let json = ModelClient::build_harmony_conversation_json("", &[], true).unwrap();
         assert!(json.contains("\"role\":\"developer\""));
         assert!(json.contains("Available tools"));
     }

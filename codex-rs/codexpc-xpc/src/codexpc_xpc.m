@@ -62,6 +62,7 @@ static void codexpc_send_create(codexpc_handle* h,
     }
     const char* tool_name = NULL;
     const char* tool_input = NULL;
+    const char* tool_output = NULL;
     // If this is an output_item.done, surface the item.type and item.status via code/message
     if (typ && strcmp(typ, "output_item.done") == 0) {
       xpc_object_t item = xpc_dictionary_get_value(ev, "item");
