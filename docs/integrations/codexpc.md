@@ -1,16 +1,11 @@
 # CodexPC (macOS XPC) integration
 
-Codex uses HTTP model providers by default (OpenAI Responses, Chat Completions, or compatible). `codexpc` is a macOS‑only XPC daemon that runs GPT‑OSS locally with low latency and does not expose an HTTP API.
-
-Until a native provider is added to Codex, the recommended setup is:
-
-- Use `codexpc` directly for local development flows and smoke tests (streaming over XPC).
-- Keep Codex configured with your preferred HTTP provider (e.g., OpenAI or a local Ollama instance) for day‑to‑day use.
+Codex uses HTTP model providers by default (OpenAI Responses, Chat Completions, or compatible). `codexpc` is a macOS‑only XPC daemon that runs GPT‑OSS locally with low latency and does not expose an HTTP API. A native Codex provider integrates directly via XPC on macOS.
 
 Status:
 
 - The `codexpc` daemon and client library are available at `../codexpc`.
-- A native provider for Codex is available (macOS-only, initial integration via the `codexpc-cli` helper).
+- The native provider for Codex (macOS-only) uses XPC directly; on non‑macOS, a CLI shim is used for smoke tests.
 
 Getting started with `codexpc`:
 
@@ -52,5 +47,8 @@ export CODEXPC_SERVICE=com.yourorg.codexpc
 ```
 
 Notes:
-- This first version uses the `codexpc-cli` helper to stream output.
-- Instructions (system prompt) are sent; richer inputs and tools will be added in a future update.
+- On macOS, Codex streams via XPC and produces final‑only deltas. Commentary is suppressed.
+- A macOS‑only integration smoke test is available (ignored by default): `codex-rs/core/tests/mac_codexpc_integration.rs`.
+  - Set `CODEXPC_CHECKPOINT` to your local GPT‑OSS checkpoint.
+  - Optionally set `CODEXPCD_BIN` to the installed `codexpcd` path to spawn the daemon for the test.
+  - The test asserts `Created` → final `delta(s)` → `Completed`.

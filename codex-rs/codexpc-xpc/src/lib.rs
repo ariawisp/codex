@@ -38,10 +38,26 @@ extern "C" {
 pub enum Event {
     Created,
     OutputTextDelta(String),
-    Completed { response_id: String, input_tokens: u64, output_tokens: u64, total_tokens: u64 },
-    Error { code: String, message: String },
-    OutputItemDone { item_type: String, status: String, name: String, input: String },
-    OutputItemOutput { name: String, output: String },
+    Completed {
+        response_id: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        total_tokens: u64,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+    OutputItemDone {
+        item_type: String,
+        status: String,
+        name: String,
+        input: String,
+    },
+    OutputItemOutput {
+        name: String,
+        output: String,
+    },
 }
 
 pub struct Handle {
@@ -79,7 +95,9 @@ extern "C" fn on_event(
         }
         "output_text.delta" => {
             if !text.is_null() {
-                let s = unsafe { CStr::from_ptr(text) }.to_string_lossy().to_string();
+                let s = unsafe { CStr::from_ptr(text) }
+                    .to_string_lossy()
+                    .to_string();
                 let _ = tx.send(Event::OutputTextDelta(s));
             }
         }
@@ -87,34 +105,83 @@ extern "C" fn on_event(
             let id = if response_id.is_null() {
                 String::new()
             } else {
-                unsafe { CStr::from_ptr(response_id) }.to_string_lossy().to_string()
+                unsafe { CStr::from_ptr(response_id) }
+                    .to_string_lossy()
+                    .to_string()
             };
-            let _ = tx.send(Event::Completed { response_id: id, input_tokens, output_tokens, total_tokens });
+            let _ = tx.send(Event::Completed {
+                response_id: id,
+                input_tokens,
+                output_tokens,
+                total_tokens,
+            });
         }
         "output_item.done" => {
-            let item_type = if code.is_null() { String::new() } else { unsafe { CStr::from_ptr(code) }.to_string_lossy().to_string() };
-            let status = if message.is_null() { String::new() } else { unsafe { CStr::from_ptr(message) }.to_string_lossy().to_string() };
-            let name = if tool_name.is_null() { String::new() } else { unsafe { CStr::from_ptr(tool_name) }.to_string_lossy().to_string() };
-            let input = if tool_input.is_null() { String::new() } else { unsafe { CStr::from_ptr(tool_input) }.to_string_lossy().to_string() };
+            let item_type = if code.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(code) }
+                    .to_string_lossy()
+                    .to_string()
+            };
+            let status = if message.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(message) }
+                    .to_string_lossy()
+                    .to_string()
+            };
+            let name = if tool_name.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(tool_name) }
+                    .to_string_lossy()
+                    .to_string()
+            };
+            let input = if tool_input.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(tool_input) }
+                    .to_string_lossy()
+                    .to_string()
+            };
             if item_type == "tool_call.output" {
-                let output = if tool_output.is_null() { String::new() } else { unsafe { CStr::from_ptr(tool_output) }.to_string_lossy().to_string() };
+                let output = if tool_output.is_null() {
+                    String::new()
+                } else {
+                    unsafe { CStr::from_ptr(tool_output) }
+                        .to_string_lossy()
+                        .to_string()
+                };
                 let _ = tx.send(Event::OutputItemOutput { name, output });
             } else {
-                let _ = tx.send(Event::OutputItemDone { item_type, status, name, input });
+                let _ = tx.send(Event::OutputItemDone {
+                    item_type,
+                    status,
+                    name,
+                    input,
+                });
             }
         }
         "error" => {
             let c = if code.is_null() {
                 String::new()
             } else {
-                unsafe { CStr::from_ptr(code) }.to_string_lossy().to_string()
+                unsafe { CStr::from_ptr(code) }
+                    .to_string_lossy()
+                    .to_string()
             };
             let m = if message.is_null() {
                 String::new()
             } else {
-                unsafe { CStr::from_ptr(message) }.to_string_lossy().to_string()
+                unsafe { CStr::from_ptr(message) }
+                    .to_string_lossy()
+                    .to_string()
             };
-            let _ = tx.send(Event::Error { code: c, message: m });
+            let _ = tx.send(Event::Error {
+                code: c,
+                message: m,
+            });
         }
         _ => {}
     }
@@ -142,9 +209,21 @@ pub fn stream(
             s.as_ptr(),
             ck.as_ptr(),
             ins.as_ptr(),
-            conversation_json.map(|s| CString::new(s).unwrap()).as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
-            tools_json.map(|s| CString::new(s).unwrap()).as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
-            reasoning_json.map(|s| CString::new(s).unwrap()).as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
+            conversation_json
+                .map(|s| CString::new(s).unwrap())
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(std::ptr::null()),
+            tools_json
+                .map(|s| CString::new(s).unwrap())
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(std::ptr::null()),
+            reasoning_json
+                .map(|s| CString::new(s).unwrap())
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(std::ptr::null()),
             temperature as c_double,
             max_tokens,
             on_event,
