@@ -417,12 +417,17 @@ impl ModelClient {
                         tx.send(Ok(ResponseEvent::Completed { response_id, token_usage: usage })).await
                     },
                     codexpc_xpc::Event::OutputItemDone { item_type, status, name, input } => {
-                        // Map tool placeholder into a CustomToolCall; use name/input when present
+                        // Map tool placeholder into a CustomToolCall; use computed name for both call_id and name
+                        let call_name = if name.is_empty() {
+                            if item_type.is_empty() { "tool".into() } else { item_type }
+                        } else {
+                            name
+                        };
                         let item = codex_protocol::models::ResponseItem::CustomToolCall {
                             id: None,
                             status: if status.is_empty() { None } else { Some(status) },
-                            call_id: "codexpc".into(),
-                            name: if name.is_empty() { if item_type.is_empty() { "tool".into() } else { item_type } } else { name },
+                            call_id: call_name.clone(),
+                            name: call_name,
                             input,
                         };
                         tx.send(Ok(ResponseEvent::OutputItemDone(item))).await
