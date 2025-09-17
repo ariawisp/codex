@@ -11,6 +11,9 @@ pub mod bash;
 mod chat_completions;
 mod client;
 mod client_common;
+mod codexpc;
+#[cfg(not(target_os = "macos"))]
+mod codexpc_cli;
 pub mod codex;
 mod codex_conversation;
 pub mod token_data;
