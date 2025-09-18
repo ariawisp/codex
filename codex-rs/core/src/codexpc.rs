@@ -23,7 +23,8 @@ impl ModelClient {
             std::env::var("CODEXPC_SERVICE").unwrap_or_else(|_| "com.yourorg.codexpc".into());
         // Keep instructions empty for CodexPC XPC; daemon injects minimal Harmony scaffold.
         let instructions = String::new();
-        let max_tokens = self.get_max_output_tokens();
+        // Always request unlimited tokens; the daemon will stop on Harmony stop tokens.
+        let max_tokens = 0u64;
         let temperature = 0.0f64; // TODO: plumb sampling
         // Build Harmony conversation JSON using a helper
         let formatted = prompt.get_formatted_input();
