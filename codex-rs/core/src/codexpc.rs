@@ -67,10 +67,12 @@ impl ModelClient {
         );
         let (tx, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
         task::spawn(async move {
+            let mut assistant_buf = String::new();
             while let Some(ev) = rx.recv().await {
                 let send = match ev {
                     codexpc_xpc::Event::Created => tx.send(Ok(ResponseEvent::Created)).await,
                     codexpc_xpc::Event::OutputTextDelta(s) => {
+                        assistant_buf.push_str(&s);
                         tx.send(Ok(ResponseEvent::OutputTextDelta(s))).await
                     }
                     codexpc_xpc::Event::Completed {
@@ -79,6 +81,18 @@ impl ModelClient {
                         output_tokens,
                         total_tokens,
                     } => {
+                        // Emit a final assistant message so history is preserved for next turns
+                        if !assistant_buf.is_empty() {
+                            let item = codex_protocol::models::ResponseItem::Message {
+                                id: None,
+                                role: "assistant".into(),
+                                content: vec![codex_protocol::models::ContentItem::OutputText {
+                                    text: std::mem::take(&mut assistant_buf),
+                                }],
+                            };
+                            // Reuse OutputItemDone carrier to inject the final message
+                            let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        }
                         let usage = Some(TokenUsage {
                             input_tokens,
                             cached_input_tokens: 0,
