@@ -97,24 +97,27 @@ impl ModelClient {
                         status,
                         name,
                         input,
+                        call_id,
                     } => {
                         let call_name = if name.is_empty() {
                             if item_type.is_empty() { "tool".into() } else { item_type }
                         } else {
                             name
                         };
+                        let call_id_final = call_id.unwrap_or_else(|| call_name.clone());
                         let item = codex_protocol::models::ResponseItem::CustomToolCall {
                             id: None,
                             status: if status.is_empty() { None } else { Some(status) },
-                            call_id: call_name.clone(),
+                            call_id: call_id_final,
                             name: call_name,
                             input,
                         };
                         tx.send(Ok(ResponseEvent::OutputItemDone(item))).await
                     }
-                    codexpc_xpc::Event::OutputItemOutput { name, output } => {
+                    codexpc_xpc::Event::OutputItemOutput { name, output, call_id } => {
+                        let call_id_final = call_id.unwrap_or(name);
                         let item = codex_protocol::models::ResponseItem::CustomToolCallOutput {
-                            call_id: name,
+                            call_id: call_id_final,
                             output,
                         };
                         tx.send(Ok(ResponseEvent::OutputItemDone(item))).await

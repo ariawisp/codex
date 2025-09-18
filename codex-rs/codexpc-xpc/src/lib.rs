@@ -53,10 +53,12 @@ pub enum Event {
         status: String,
         name: String,
         input: String,
+        call_id: Option<String>,
     },
     OutputItemOutput {
         name: String,
         output: String,
+        call_id: Option<String>,
     },
 }
 
@@ -145,6 +147,14 @@ extern "C" fn on_event(
                     .to_string_lossy()
                     .to_string()
             };
+            let call_id = if response_id.is_null() {
+                None
+            } else {
+                let s = unsafe { CStr::from_ptr(response_id) }
+                    .to_string_lossy()
+                    .to_string();
+                if s.is_empty() { None } else { Some(s) }
+            };
             if item_type == "tool_call.output" {
                 let output = if tool_output.is_null() {
                     String::new()
@@ -153,13 +163,14 @@ extern "C" fn on_event(
                         .to_string_lossy()
                         .to_string()
                 };
-                let _ = tx.send(Event::OutputItemOutput { name, output });
+                let _ = tx.send(Event::OutputItemOutput { name, output, call_id });
             } else {
                 let _ = tx.send(Event::OutputItemDone {
                     item_type,
                     status,
                     name,
                     input,
+                    call_id,
                 });
             }
         }

@@ -58,6 +58,9 @@ static void codexpc_send_create(codexpc_handle* h,
       if (item && xpc_get_type(item) == XPC_TYPE_DICTIONARY) {
         code = xpc_dictionary_get_string(item, "type");
         message = xpc_dictionary_get_string(item, "status");
+        // Reuse response_id slot to carry call_id for tool events
+        const char* call_id = xpc_dictionary_get_string(item, "call_id");
+        if (call_id) { response_id = call_id; }
       }
     }
     const char* tool_name = NULL;
