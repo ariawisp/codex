@@ -137,30 +137,7 @@ impl ModelClient {
     }
 
     #[cfg(target_os = "macos")]
-    fn json_escape(s: &str) -> String {
-        s.replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-            .replace('\t', "\\t")
-    }
-
-    #[cfg(target_os = "macos")]
-    fn build_content_part_json(part: &codex_protocol::models::ContentItem) -> Option<String> {
-        match part {
-            codex_protocol::models::ContentItem::InputText { text }
-            | codex_protocol::models::ContentItem::OutputText { text } => Some(format!(
-                "{{\"type\":\"text\",\"text\":\"{}\"}}",
-                Self::json_escape(text)
-            )),
-            codex_protocol::models::ContentItem::InputImage { image_url } => {
-                Some(format!(
-                    "{{\"type\":\"image\",\"image_url\":\"{}\"}}",
-                    Self::json_escape(image_url)
-                ))
-            }
-        }
-    }
+    // json_escape and string-based content renderers were removed in favor of serde_json
 
     #[cfg(target_os = "macos")]
     fn build_harmony_conversation_json(
@@ -168,51 +145,54 @@ impl ModelClient {
         items: &[ResponseItem],
         include_dev_tools_msg: bool,
     ) -> Option<String> {
-        let mut conv_msgs: Vec<String> = Vec::new();
+        use serde_json::json;
+        let mut messages: Vec<serde_json::Value> = Vec::new();
         if !instructions.is_empty() {
-            conv_msgs.push(format!(
-                "{{\"role\":\"system\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}",
-                Self::json_escape(instructions)
-            ));
+            messages.push(json!({
+                "role": "system",
+                "content": [{"type": "text", "text": instructions}],
+            }));
         } else {
-            let sys = "# Valid channels: analysis, commentary, final.\\nAlways write user-facing responses in the final channel; use analysis only for internal reasoning.";
-            conv_msgs.push(format!(
-                "{{\"role\":\"system\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}",
-                Self::json_escape(sys)
-            ));
+            let sys = "# Valid channels: analysis, commentary, final.
+Always write user-facing responses in the final channel; use analysis only for internal reasoning.";
+            messages.push(json!({
+                "role": "system",
+                "content": [{"type": "text", "text": sys}],
+            }));
         }
         if include_dev_tools_msg {
             if let Some(desc) = Self::build_tool_description() {
-                conv_msgs.push(format!(
-                    "{{\"author\":{{\"role\":\"developer\"}},\"content\":[{{\"text\":\"{}\"}}]}}",
-                    Self::json_escape(&desc)
-                ));
+                messages.push(json!({
+                    "role": "developer",
+                    "content": [{"type": "text", "text": desc}],
+                }));
             }
         }
         for item in items.iter() {
             if let ResponseItem::Message { role, content, .. } = item {
-                let mut parts: Vec<String> = Vec::new();
+                let mut parts: Vec<serde_json::Value> = Vec::new();
                 for part in content.iter() {
-                    if let Some(js) = Self::build_content_part_json(part) {
-                        parts.push(js);
+                    match part {
+                        codex_protocol::models::ContentItem::InputText { text }
+                        | codex_protocol::models::ContentItem::OutputText { text } => {
+                            parts.push(json!({"type": "text", "text": text}));
+                        }
+                        codex_protocol::models::ContentItem::InputImage { image_url } => {
+                            parts.push(json!({"type": "image", "image_url": image_url}));
+                        }
                     }
                 }
                 if !parts.is_empty() {
-                    let role_esc = role.replace('"', "\"");
-                    conv_msgs.push(format!(
-                        "{{\"role\":\"{}\",\"content\":[{}]}}",
-                        role_esc,
-                        parts.join(",")
-                    ));
+                    messages.push(json!({
+                        "role": role,
+                        "content": parts,
+                    }));
                 }
             }
         }
-        if conv_msgs.is_empty() {
-            None
-        } else {
-            Some(format!("{{\"messages\":[{}]}}", conv_msgs.join(",")))
-        }
+        if messages.is_empty() { None } else { Some(json!({"messages": messages}).to_string()) }
     }
+    
 
     #[cfg(target_os = "macos")]
     fn build_tool_description() -> Option<String> {
