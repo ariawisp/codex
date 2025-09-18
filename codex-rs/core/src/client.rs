@@ -156,8 +156,18 @@ impl ModelClient {
 
     /// Implementation for the OpenAI *Responses* experimental API.
     async fn stream_responses(&self, prompt: &Prompt) -> Result<ResponseStream> {
-        // Special-case: CodexPC provider uses a local macOS XPC daemon. Prefer
-        // direct XPC on macOS; fall back to a CLI shim otherwise.
+        // Special-case: CodexPC provider uses a local macOS XPC daemon.
+        // On macOS, if a checkpoint is configured via env, prefer XPC directly
+        // regardless of provider settings; otherwise, prefer when provider is xpc://.
+        #[cfg(target_os = "macos")]
+        {
+            if std::env::var("CODEXPC_CHECKPOINT").is_ok()
+                || std::env::var("CODEXPC_CHECKPOINT_PATH").is_ok()
+            {
+                return self.stream_via_codexpc_xpc(prompt).await;
+            }
+        }
+        // Fall back to the provider-based routing (xpc:// → XPC; else HTTP/CLI).
         if self
             .provider
             .base_url

@@ -100,6 +100,37 @@ Codex CLI supports a rich set of configuration options, with preferences stored 
 
 ---
 
+## macOS local model (CodexPC)
+
+On macOS, Codex can stream from a local GPT‑OSS model via a native XPC daemon for low latency.
+
+Quickstart:
+
+- Install the daemon from the sibling repo and set your checkpoint path:
+
+```
+cd ../codexpc
+./packaging/install-agent.sh
+export CODEXPC_CHECKPOINT=/path/to/gpt-oss/model.bin
+```
+
+- Run Codex (auto-detects the daemon on macOS when `CODEXPC_CHECKPOINT` is set):
+
+```
+codex "hello"
+```
+
+Diagnostics:
+
+- Print encoding metadata before a run:
+
+```
+export CODEXPC_DEBUG_HANDSHAKE=1
+codex "hello"
+```
+
+More details in Integrations: [CodexPC (macOS XPC)](./docs/integrations/codexpc.md).
+
 ## License
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).

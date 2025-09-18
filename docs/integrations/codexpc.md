@@ -6,6 +6,7 @@ Status:
 
 - The `codexpc` daemon and client library are available at `../codexpc`.
 - The native provider for Codex (macOS-only) uses XPC directly; on non‑macOS, a CLI shim is used for smoke tests.
+- Prefill is rendered to tokens using Harmony in-process (Rust) and sent over XPC. Streaming uses Harmony parser events (final-only deltas by default) with tool call parity.
 
 Getting started with `codexpc`:
 
@@ -46,8 +47,12 @@ export CODEXPC_CHECKPOINT=/path/to/gpt-oss/model.bin
 export CODEXPC_SERVICE=com.yourorg.codexpc
 ```
 
+On macOS, when `CODEXPC_CHECKPOINT` (or `CODEXPC_CHECKPOINT_PATH`) is set, Codex automatically prefers the native XPC provider regardless of the configured provider.
+
 Notes:
 - On macOS, Codex streams via XPC and produces final‑only deltas. Commentary is suppressed.
+- Tokens-over-XPC is the default path. Typed messages and conversation JSON remain as compatibility fallbacks in the daemon.
+- Handshake endpoint (daemon): send `{type: "handshake"}` to retrieve `encoding_name`, `special_tokens`, and `stop_tokens_for_assistant_actions` for diagnostics.
 - A macOS‑only integration smoke test is available (ignored by default): `codex-rs/core/tests/mac_codexpc_integration.rs`.
   - Set `CODEXPC_CHECKPOINT` to your local GPT‑OSS checkpoint.
   - Optionally set `CODEXPCD_BIN` to the installed `codexpcd` path to spawn the daemon for the test.

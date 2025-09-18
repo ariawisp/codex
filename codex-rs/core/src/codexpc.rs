@@ -21,21 +21,21 @@ impl ModelClient {
             })?;
         let service =
             std::env::var("CODEXPC_SERVICE").unwrap_or_else(|_| "com.yourorg.codexpc".into());
-        // Keep instructions empty for CodexPC XPC; daemon injects minimal Harmony scaffold.
+        // Optional debug handshake for diagnostics
+        if std::env::var("CODEXPC_DEBUG_HANDSHAKE").is_ok() {
+            if let Some(hs) = codexpc_xpc::handshake(&service) {
+                tracing::info!(target: "codexpc", "handshake encoding_name={:?} special_tokens_count={} stop_tokens_for_assistant_actions_count={}",
+                    hs.encoding_name, hs.special_tokens.len(), hs.stop_tokens_for_assistant_actions.len());
+            }
+        }
+        // Keep instructions empty for CodexPC XPC; daemon injects minimal Harmony scaffold for JSON path.
         let instructions = String::new();
         // Always request unlimited tokens; the daemon will stop on Harmony stop tokens.
         let max_tokens = 0u64;
         let temperature = 0.0f64; // TODO: plumb sampling
-        // Build Harmony conversation JSON using a helper
+        // Build typed Harmony messages and render prefill tokens via Harmony
         let formatted = prompt.get_formatted_input();
-        let include_dev_tools_msg = !prompt.tools.is_empty();
-        let conversation_json =
-            Self::build_harmony_conversation_json("", &formatted, include_dev_tools_msg);
-        let tools_json = if !prompt.tools.is_empty() {
-            Some(String::from("[]"))
-        } else {
-            None
-        };
+        let harmony_tools_json = Self::build_harmony_tools_json(prompt);
         // Include minimal reasoning flags when configured
         let reasoning_json = {
             let effort = self.get_reasoning_effort();
@@ -55,12 +55,66 @@ impl ModelClient {
             }
         };
 
-        let (handle, mut rx) = codexpc_xpc::stream(
+        // Render tokens with Harmony and stream via tokens-over-XPC by default
+        use openai_harmony::chat::{Conversation, DeveloperContent, Message, Role};
+        use openai_harmony::{load_harmony_encoding, HarmonyEncodingName};
+        let mut messages: Vec<Message> = Vec::new();
+        // System message with default content; optionally include instructions as text
+        let mut sys = Message::from_role_and_content(Role::System, openai_harmony::chat::SystemContent::new());
+        // Historical behavior: add instructions (or default system text) as plain text in system message
+        let sys_text = if !instructions.is_empty() {
+            instructions.clone()
+        } else {
+            String::from(
+                "# Valid channels: analysis, commentary, final.\nAlways write user-facing responses in the final channel; use analysis only for internal reasoning.",
+            )
+        };
+        sys = sys.adding_content(sys_text);
+        messages.push(sys);
+        if let Some(tools_root) = Self::tools_for_harmony(prompt) {
+            let dev = DeveloperContent::new().with_tools(tools_root);
+            messages.push(Message::from_role_and_content(Role::Developer, dev));
+        }
+        // Add user/assistant history
+        for item in formatted.iter() {
+            if let ResponseItem::Message { role, content, .. } = item {
+                let parsed_role = match role.as_str() {
+                    "system" => Role::System,
+                    "developer" => Role::Developer,
+                    "assistant" => Role::Assistant,
+                    "tool" => Role::Tool,
+                    _ => Role::User,
+                };
+                let mut msg = Message::from_role_and_content(parsed_role, "");
+                for part in content.iter() {
+                    match part {
+                        codex_protocol::models::ContentItem::InputText { text }
+                        | codex_protocol::models::ContentItem::OutputText { text } => {
+                            msg = msg.adding_content(text.clone());
+                        }
+                        codex_protocol::models::ContentItem::InputImage { .. } => {
+                            // images unsupported in tokens path prefill for now
+                        }
+                    }
+                }
+                messages.push(msg);
+            }
+        }
+        let conversation = Conversation::from_messages(messages);
+        let enc = load_harmony_encoding(HarmonyEncodingName::HARMONY_GPT_OSS)
+            .map_err(|e| CodexErr::Other(format!("harmony load failed: {e}")))?;
+        let prefill: Vec<u32> = enc
+            .render_conversation_for_completion(&conversation, Role::Assistant, None)
+            .map_err(|e| CodexErr::Other(format!("harmony render failed: {e}")))?
+            .into_iter()
+            .collect();
+        let prime_final = true;
+        let (handle, mut rx) = codexpc_xpc::stream_from_tokens(
             &service,
             &checkpoint,
-            &instructions,
-            conversation_json.as_deref(),
-            tools_json.as_deref(),
+            &prefill,
+            prime_final,
+            harmony_tools_json.as_deref(),
             reasoning_json.as_deref(),
             temperature,
             max_tokens,
@@ -105,6 +159,10 @@ impl ModelClient {
                             token_usage: usage,
                         }))
                         .await
+                    }
+                    codexpc_xpc::Event::Metrics { ttfb_ms, tokens_per_sec, delta_count, tool_calls } => {
+                        tracing::info!(target: "codexpc", "metrics ttfb_ms={} tokens_per_sec={} delta_count={} tool_calls={}", ttfb_ms, tokens_per_sec, delta_count, tool_calls);
+                        continue;
                     }
                     codexpc_xpc::Event::OutputItemDone {
                         item_type,
@@ -206,7 +264,45 @@ Always write user-facing responses in the final channel; use analysis only for i
         }
         if messages.is_empty() { None } else { Some(json!({"messages": messages}).to_string()) }
     }
-    
+
+    #[cfg(target_os = "macos")]
+    fn tools_for_harmony(prompt: &Prompt) -> Option<openai_harmony::chat::ToolNamespaceConfig> {
+        use crate::openai_tools::OpenAiTool;
+        use openai_harmony::chat::{ToolDescription, ToolNamespaceConfig};
+        let mut tools: Vec<ToolDescription> = Vec::new();
+        for t in prompt.tools.iter() {
+            if let OpenAiTool::Function(f) = t {
+                let params = serde_json::to_value(&f.parameters).ok();
+                tools.push(ToolDescription::new(&f.name, &f.description, params));
+            }
+        }
+        if tools.is_empty() { None } else { Some(ToolNamespaceConfig::new("functions", None, tools)) }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn build_harmony_tools_json(prompt: &Prompt) -> Option<String> {
+        use crate::openai_tools::OpenAiTool;
+        let mut arr: Vec<serde_json::Value> = Vec::new();
+        for t in prompt.tools.iter() {
+            if let OpenAiTool::Function(f) = t {
+                if let Ok(params) = serde_json::to_value(&f.parameters) {
+                    arr.push(serde_json::json!({
+                        "name": f.name,
+                        "json_schema": params,
+                    }));
+                }
+            }
+        }
+        if arr.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!({
+                "version": 1,
+                "namespace": "functions",
+                "tools": arr,
+            }).to_string())
+        }
+    }
 
     #[cfg(target_os = "macos")]
     fn build_tool_description() -> Option<String> {
